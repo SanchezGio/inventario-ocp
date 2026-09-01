@@ -1,0 +1,113 @@
+name: OpenShift → GitHub Governance Audit
+
+# Recorre todos los namespaces de OpenShift, sus Deployments, resuelve el
+# ImageStream/Tag de cada uno, intenta encontrar el repositorio de GitHub de
+# origen (vía BuildConfig, anotaciones o labels de imagen S2I) y consulta en
+# GitHub: existencia del repo, rama main, carpeta .github, CODEOWNERS y
+# rulesets. Todo queda asociado deployment -> repo en un único JSON.
+#
+# Requiere un runner self-hosted con:
+#   - Red hacia el API server de OpenShift
+#   - CLI `oc` instalado (o el paso "Ensure oc CLI" lo descarga en Linux)
+#   - Python 3.11+
+#
+# Secrets requeridos (a nivel de repo u organización):
+#   OPENSHIFT_SERVER  -> URL del API server, ej. https://api.cluster.example.com:6443
+#   OPENSHIFT_TOKEN   -> Token de una ServiceAccount con permisos de lectura
+#                        (get/list) sobre namespaces, deployments, imagestreams
+#                        y buildconfigs en los namespaces a auditar.
+#   GH_PAT            -> Personal Access Token de GitHub con permisos de
+#                        lectura de contenido y "Administration: read" (para
+#                        poder listar rulesets) en los repos a inspeccionar.
+#
+# Variables opcionales (Settings > Actions > Variables):
+#   OPENSHIFT_SKIP_TLS_VERIFY -> "true" si el cluster usa certificados
+#                                 autofirmados (default: false)
+#   GITHUB_API_URL             -> Para GitHub Enterprise Server, ej.
+#                                 https://github.miempresa.com/api/v3
+#                                 (default: https://api.github.com)
+
+on:
+  workflow_dispatch:
+    inputs:
+      namespace_exclude_prefixes:
+        description: "Prefijos de namespaces a excluir, separados por coma"
+        required: false
+        default: "openshift-,kube-"
+      namespace_exclude_exact:
+        description: "Nombres exactos de namespaces a excluir, separados por coma"
+        required: false
+        default: "default,openshift,kube-system,kube-public,kube-node-lease"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openshift-github-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: [self-hosted, openshift]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install --quiet -r scripts/requirements.txt
+
+      - name: Ensure oc CLI is available
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v oc >/dev/null 2>&1; then
+            echo "oc CLI ya está instalado: $(oc version --client 2>/dev/null | head -n1)"
+            exit 0
+          fi
+          echo "oc CLI no encontrado, descargando cliente estable de OpenShift..."
+          curl -sSL -o /tmp/oc.tar.gz \
+            https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/stable/openshift-client-linux.tar.gz
+          sudo tar -xzf /tmp/oc.tar.gz -C /usr/local/bin oc
+          oc version --client
+
+      - name: Login a OpenShift
+        shell: bash
+        env:
+          OPENSHIFT_SERVER: ${{ secrets.OPENSHIFT_SERVER }}
+          OPENSHIFT_TOKEN: ${{ secrets.OPENSHIFT_TOKEN }}
+          OPENSHIFT_SKIP_TLS_VERIFY: ${{ vars.OPENSHIFT_SKIP_TLS_VERIFY || 'false' }}
+        run: |
+          set -euo pipefail
+          if [ "$OPENSHIFT_SKIP_TLS_VERIFY" = "true" ]; then
+            oc login --token="$OPENSHIFT_TOKEN" --server="$OPENSHIFT_SERVER" --insecure-skip-tls-verify=true
+          else
+            oc login --token="$OPENSHIFT_TOKEN" --server="$OPENSHIFT_SERVER"
+          fi
+          oc whoami
+
+      - name: Ejecutar auditoría OpenShift → GitHub
+        shell: bash
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_API_URL: ${{ vars.GITHUB_API_URL || 'https://api.github.com' }}
+          NAMESPACE_EXCLUDE_PREFIXES: ${{ github.event.inputs.namespace_exclude_prefixes || 'openshift-,kube-' }}
+          NAMESPACE_EXCLUDE_EXACT: ${{ github.event.inputs.namespace_exclude_exact || 'default,openshift,kube-system,kube-public,kube-node-lease' }}
+        run: |
+          python scripts/openshift_github_audit.py \
+            --output audit-result.json \
+            --exclude-prefixes "$NAMESPACE_EXCLUDE_PREFIXES" \
+            --exclude-exact "$NAMESPACE_EXCLUDE_EXACT" \
+            --github-api-url "$GITHUB_API_URL"
+
+      - name: Subir resultado como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: openshift-github-audit-${{ github.run_id }}
+          path: audit-result.json
+          retention-days: 30
