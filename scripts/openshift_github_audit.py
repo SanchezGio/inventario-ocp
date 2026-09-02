@@ -18,7 +18,6 @@ Uso:
         --github-api-url https://api.github.com
 """
 
-from __future__ import annotations
 
 import argparse
 import json
@@ -27,7 +26,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 
@@ -47,7 +46,12 @@ def oc_json(*args: str) -> Any:
     cmd = ["oc", *args, "-o", "json"]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, check=True, timeout=120
+            cmd,
+            stdout=subprocess.PIPE,s
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            check=True,
+            timeout=120,
         )
         return json.loads(result.stdout)
     except subprocess.CalledProcessError as exc:
@@ -66,7 +70,7 @@ def oc_json(*args: str) -> Any:
 # --------------------------------------------------------------------------
 
 
-def list_namespaces(exclude_prefixes: list[str], exclude_exact: set[str]) -> list[str]:
+def list_namespaces(exclude_prefixes: List[str], exclude_exact: Set[str]) -> List[str]:
     data = oc_json("get", "namespace")
     if not data:
         return []
@@ -80,7 +84,7 @@ def list_namespaces(exclude_prefixes: list[str], exclude_exact: set[str]) -> lis
     return kept
 
 
-def list_deployments(namespace: str) -> list[dict]:
+def list_deployments(namespace: str) -> List[dict]:
     data = oc_json("get", "deployment", "-n", namespace)
     if not data:
         return []
@@ -100,16 +104,16 @@ class NamespaceCache:
     llamadas `oc` por cada deployment/contenedor."""
 
     def __init__(self) -> None:
-        self._imagestreams: dict[str, list[dict]] = {}
-        self._buildconfigs: dict[str, list[dict]] = {}
+        self._imagestreams: Dict[str, List[dict]] = {}
+        self._buildconfigs: Dict[str, List[dict]] = {}
 
-    def imagestreams(self, ns: str) -> list[dict]:
+    def imagestreams(self, ns: str) -> List[dict]:
         if ns not in self._imagestreams:
             data = oc_json("get", "imagestream", "-n", ns)
             self._imagestreams[ns] = data.get("items", []) if data else []
         return self._imagestreams[ns]
 
-    def buildconfigs(self, ns: str) -> list[dict]:
+    def buildconfigs(self, ns: str) -> List[dict]:
         if ns not in self._buildconfigs:
             data = oc_json("get", "buildconfig", "-n", ns)
             self._buildconfigs[ns] = data.get("items", []) if data else []
@@ -118,7 +122,7 @@ class NamespaceCache:
 
 def resolve_container_imagestream(
     deployment: dict, namespace: str, cache: NamespaceCache
-) -> list[dict]:
+) -> List[dict]:
     """Devuelve, por cada contenedor del deployment, la info de matching:
     {"container": str, "image": str, "imagestream": str|None, "tag": str|None,
      "match_method": str}
@@ -208,7 +212,7 @@ GITHUB_URL_RE = re.compile(
 )
 
 
-def extract_github_repo(text: str) -> Optional[tuple[str, str]]:
+def extract_github_repo(text: str) -> Optional[Tuple[str, str]]:
     """Busca un owner/repo de GitHub dentro de un string arbitrario
     (URL de BuildConfig, valor de anotación o label)."""
     if not text:
@@ -216,7 +220,9 @@ def extract_github_repo(text: str) -> Optional[tuple[str, str]]:
     m = GITHUB_URL_RE.search(text.strip())
     if m:
         owner, repo = m.group(1), m.group(2)
-        return owner, repo.removesuffix(".git")
+        if repo.endswith(".git"):
+            repo = repo[: -len(".git")]
+        return owner, repo
     # búsqueda más laxa dentro de un texto largo (p.ej. una anotación con
     # varias palabras)
     m2 = re.search(r"github\.com[:/]([\w.-]+)/([\w.-]+?)(?:\.git)?(?=[\s\"'/]|$)", text)
@@ -256,7 +262,7 @@ def find_source_via_imagestream_annotations(
     for stream in cache.imagestreams(namespace):
         if stream["metadata"]["name"] != imagestream:
             continue
-        candidates: list[str] = []
+        candidates: List[str] = []
         candidates.extend((stream["metadata"].get("annotations") or {}).values())
         for spec_tag in stream.get("spec", {}).get("tags", []):
             if spec_tag.get("name") == tag:
@@ -334,7 +340,7 @@ class GitHubClient:
             }
         )
 
-    def get(self, path: str) -> tuple[int, Any]:
+    def get(self, path: str) -> Tuple[int, Any]:
         url = f"{self.api_url}{path}"
         for attempt in range(3):
             resp = self.session.get(url, timeout=30)
@@ -356,7 +362,7 @@ class GitHubClient:
         return resp.status_code, None
 
     def repo_audit(self, owner: str, repo: str) -> dict:
-        info: dict[str, Any] = {
+        info: Dict[str, Any] = {
             "owner": owner,
             "repo": repo,
             "url": f"https://github.com/{owner}/{repo}",
@@ -442,9 +448,9 @@ def main() -> int:
 
     cache = NamespaceCache()
     gh = GitHubClient(gh_token, args.github_api_url)
-    repo_cache: dict[str, dict] = {}  # "owner/repo" -> repo_audit result
-    deployments_out: list[dict] = []
-    errors: list[str] = []
+    repo_cache: Dict[str, dict] = {}  # "owner/repo" -> repo_audit result
+    deployments_out: List[dict] = []
+    errors: List[str] = []
 
     namespaces = list_namespaces(exclude_prefixes, exclude_exact)
 
@@ -460,7 +466,7 @@ def main() -> int:
                 continue
 
             for cm in container_matches:
-                entry: dict[str, Any] = {
+                entry: Dict[str, Any] = {
                     "namespace": ns,
                     "deployment": dep_name,
                     "container": cm["container"],
