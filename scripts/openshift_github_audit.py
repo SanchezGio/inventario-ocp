@@ -270,6 +270,51 @@ def find_source_via_buildconfig(
     return None
 
 
+def _image_base_ref(ref: str) -> str:
+    """Quita el tag (':tag') o digest ('@sha256:...') de una referencia de
+    imagen, dejando solo 'registry[:puerto]/namespace/nombre', para poder
+    comparar imágenes ignorando la versión concreta publicada."""
+    if not ref:
+        return ref
+    base = ref.split("@", 1)[0]
+    host_and_path, sep, last = base.rpartition("/")
+    if ":" in last:
+        last = last.split(":", 1)[0]
+    return f"{host_and_path}{sep}{last}"
+
+
+def find_source_via_buildconfig_direct_image(
+    namespace: str, image: str, cache: NamespaceCache
+) -> Optional[dict]:
+    """Fallback para apps sin ImageStream: algunos pipelines configuran el
+    BuildConfig con `output.to.kind: DockerImage` (push directo al registry
+    interno, sin pasar por un ImageStream). En esos casos no hay
+    ImageStream/Tag que resolver, así que comparamos directamente la imagen
+    del contenedor contra el output del BuildConfig (ignorando tag/digest)."""
+    if not image:
+        return None
+    image_base = _image_base_ref(image)
+    for bc in cache.buildconfigs(namespace):
+        output_to = bc.get("spec", {}).get("output", {}).get("to", {})
+        if output_to.get("kind") != "DockerImage":
+            continue
+        if _image_base_ref(output_to.get("name", "")) != image_base:
+            continue
+        source = bc.get("spec", {}).get("source", {})
+        git = source.get("git")
+        if git and git.get("uri"):
+            repo = extract_github_repo(git["uri"])
+            if repo:
+                return {
+                    "owner": repo[0],
+                    "repo": repo[1],
+                    "raw_uri": git["uri"],
+                    "detection_method": "buildconfig-git-source (output directo a registry)",
+                    "buildconfig": bc["metadata"]["name"],
+                }
+    return None
+
+
 def find_source_via_imagestream_annotations(
     namespace: str, imagestream: str, tag: str, cache: NamespaceCache
 ) -> Optional[dict]:
@@ -321,14 +366,28 @@ def find_source_via_image_labels(namespace: str, imagestream: str, tag: str) -> 
     return None
 
 
-def find_github_source(namespace: str, imagestream: str, tag: str, cache: NamespaceCache) -> Optional[dict]:
-    if not imagestream or not tag:
-        return None
-    for finder in (
-        lambda: find_source_via_buildconfig(namespace, imagestream, tag, cache),
-        lambda: find_source_via_imagestream_annotations(namespace, imagestream, tag, cache),
-        lambda: find_source_via_image_labels(namespace, imagestream, tag),
-    ):
+def find_github_source(
+    namespace: str, image: str, imagestream: Optional[str], tag: Optional[str], cache: NamespaceCache
+) -> Optional[dict]:
+    """Intenta encontrar el repo de GitHub de origen de un contenedor.
+    Si se resolvió un ImageStream/Tag (imagestream y tag no None), primero
+    intenta los métodos que dependen de eso (BuildConfig -> ImageStreamTag,
+    anotaciones, labels de la imagen). Si no hay ImageStream (apps cuyo
+    BuildConfig empuja directo al registry con output.to.kind=DockerImage),
+    o si esos métodos no encontraron nada, cae a comparar la imagen del
+    contenedor directo contra el output de los BuildConfigs del namespace."""
+    finders = []
+    if imagestream and tag:
+        finders.extend(
+            [
+                lambda: find_source_via_buildconfig(namespace, imagestream, tag, cache),
+                lambda: find_source_via_imagestream_annotations(namespace, imagestream, tag, cache),
+                lambda: find_source_via_image_labels(namespace, imagestream, tag),
+            ]
+        )
+    finders.append(lambda: find_source_via_buildconfig_direct_image(namespace, image, cache))
+
+    for finder in finders:
         result = finder()
         if result:
             return result
@@ -643,9 +702,12 @@ def main() -> int:
                     "repo": None,
                 }
 
-                if cm["imagestream"] and cm["tag"]:
+                # Se intenta buscar el repo aunque no se haya resuelto un
+                # ImageStream (ver find_source_via_buildconfig_direct_image):
+                # hay apps cuyo BuildConfig empuja directo al registry.
+                if cm["image"] or (cm["imagestream"] and cm["tag"]):
                     try:
-                        source = find_github_source(ns, cm["imagestream"], cm["tag"], cache)
+                        source = find_github_source(ns, cm["image"], cm["imagestream"], cm["tag"], cache)
                     except Exception as exc:
                         errors.append(
                             f"{ns}/{dep_name}/{cm['container']}: error buscando origen GitHub: {exc}"
