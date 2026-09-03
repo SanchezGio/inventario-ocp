@@ -37,47 +37,13 @@ END;
 /
 
 -- ---------------------------------------------------------------------
--- audit_repositories: una fila por cada repo de GitHub auditado en la
--- corrida (equivalente al campo "repositories" del JSON original)
--- ---------------------------------------------------------------------
-CREATE TABLE audit_repositories (
-    id                    NUMBER(19) NOT NULL,
-    run_id                NUMBER(19) NOT NULL,
-    repo_key              VARCHAR2(500),
-    owner                 VARCHAR2(255),
-    repo                  VARCHAR2(255),
-    url                   VARCHAR2(1000),
-    exists_flag           NUMBER(1),
-    private_flag          NUMBER(1),
-    default_branch        VARCHAR2(255),
-    archived_flag         NUMBER(1),
-    has_main_branch       NUMBER(1),
-    has_github_folder     NUMBER(1),
-    codeowners_found      NUMBER(1),
-    codeowners_path       VARCHAR2(255),
-    rulesets_accessible   NUMBER(1),
-    rulesets_count        NUMBER(10),
-    rulesets_names        VARCHAR2(4000),
-    error_text            VARCHAR2(4000),
-    CONSTRAINT pk_audit_repositories PRIMARY KEY (id),
-    CONSTRAINT fk_audit_repositories_run FOREIGN KEY (run_id)
-        REFERENCES audit_runs (run_id)
-);
-
-CREATE SEQUENCE seq_audit_repositories START WITH 1 INCREMENT BY 1;
-
-CREATE OR REPLACE TRIGGER trg_audit_repositories_bi
-BEFORE INSERT ON audit_repositories
-FOR EACH ROW
-WHEN (NEW.id IS NULL)
-BEGIN
-    SELECT seq_audit_repositories.NEXTVAL INTO :NEW.id FROM dual;
-END;
-/
-
--- ---------------------------------------------------------------------
 -- audit_deployments: una fila por cada contenedor de cada Deployment
--- auditado (equivalente al campo "deployments" del JSON original)
+-- auditado, con la info del repo de GitHub correspondiente EMBEBIDA en la
+-- misma fila (denormalizado a propósito): a partir del deployment y el
+-- imagestream se puede leer directamente su repo, sin necesidad de cruzar
+-- con otra tabla. Si varios deployments comparten repo, sus datos de repo
+-- se repiten en cada fila (trade-off aceptado a cambio de que cada fila
+-- quede autocontenida y fácil de consultar).
 -- ---------------------------------------------------------------------
 CREATE TABLE audit_deployments (
     id                          NUMBER(19) NOT NULL,
@@ -92,6 +58,21 @@ CREATE TABLE audit_deployments (
     github_detection_method     VARCHAR2(100),
     github_raw_uri              VARCHAR2(2000),
     repo_key                    VARCHAR2(500),
+    repo_owner                  VARCHAR2(255),
+    repo_name                   VARCHAR2(255),
+    repo_url                    VARCHAR2(1000),
+    repo_exists                 NUMBER(1),
+    repo_private                NUMBER(1),
+    repo_default_branch         VARCHAR2(255),
+    repo_archived               NUMBER(1),
+    repo_has_main_branch        NUMBER(1),
+    repo_has_github_folder      NUMBER(1),
+    repo_codeowners_found       NUMBER(1),
+    repo_codeowners_path        VARCHAR2(255),
+    repo_rulesets_accessible    NUMBER(1),
+    repo_rulesets_count         NUMBER(10),
+    repo_rulesets_names         VARCHAR2(4000),
+    repo_error                  VARCHAR2(4000),
     CONSTRAINT pk_audit_deployments PRIMARY KEY (id),
     CONSTRAINT fk_audit_deployments_run FOREIGN KEY (run_id)
         REFERENCES audit_runs (run_id)
@@ -134,8 +115,6 @@ END;
 -- ---------------------------------------------------------------------
 -- Índices para las consultas típicas (por corrida, por repo, por ns/deploy)
 -- ---------------------------------------------------------------------
-CREATE INDEX idx_audit_repos_run     ON audit_repositories (run_id);
-CREATE INDEX idx_audit_repos_key     ON audit_repositories (repo_key);
 CREATE INDEX idx_audit_deps_run      ON audit_deployments (run_id);
 CREATE INDEX idx_audit_deps_ns_dep   ON audit_deployments (namespace, deployment);
 CREATE INDEX idx_audit_deps_repo_key ON audit_deployments (repo_key);

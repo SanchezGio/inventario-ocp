@@ -6,9 +6,11 @@ Recorre namespaces de OpenShift -> Deployments -> ImageStreams/Tags -> intenta
 resolver el repositorio de GitHub de origen de cada imagen, y consulta en
 GitHub metadata de gobierno (rama main, carpeta .github, CODEOWNERS,
 rulesets). El resultado se escribe además en un JSON local de respaldo, y se
-inserta en una base de datos Oracle (tablas audit_runs, audit_repositories,
-audit_deployments, audit_errors; ver scripts/oracle_schema.sql) en lugar de
-subirse como artefacto a GitHub, ya que el runner no tiene salida a internet.
+inserta en una base de datos Oracle (tablas audit_runs, audit_deployments,
+audit_errors; ver scripts/oracle_schema.sql) en lugar de subirse como
+artefacto a GitHub, ya que el runner no tiene salida a internet. Cada fila
+de audit_deployments queda autocontenida: deployment + imagestream + toda
+la info del repo de GitHub que le corresponde.
 
 Requiere que `oc` ya esté logueado en el cluster (oc login previo), la
 variable de entorno GH_PAT con un token de GitHub, y las variables de
@@ -463,9 +465,11 @@ def _bool_to_num(value: Optional[bool]) -> Optional[int]:
 
 def save_result_to_db(conn: "cx_Oracle.Connection", result: dict) -> int:
     """Inserta el resultado completo de la auditoría en Oracle dentro de una
-    única transacción (audit_runs, audit_repositories, audit_deployments,
-    audit_errors). Devuelve el run_id generado. Ver scripts/oracle_schema.sql
-    para el DDL de las tablas."""
+    única transacción (audit_runs, audit_deployments, audit_errors).
+    Cada fila de audit_deployments queda autocontenida: deployment +
+    imagestream + toda la info del repo de GitHub que le corresponde, sin
+    necesidad de cruzar con otra tabla. Devuelve el run_id generado. Ver
+    scripts/oracle_schema.sql para el DDL de las tablas."""
     cur = conn.cursor()
     try:
         run_id_var = cur.var(cx_Oracle.NUMBER)
@@ -492,53 +496,14 @@ def save_result_to_db(conn: "cx_Oracle.Connection", result: dict) -> int:
         )
         run_id = int(run_id_var.getvalue()[0])
 
-        repo_rows = []
-        for repo_key, info in result["repositories"].items():
-            codeowners = info.get("codeowners") or {}
-            rulesets = info.get("rulesets") or {}
-            names = rulesets.get("names") or []
-            repo_rows.append(
-                {
-                    "run_id": run_id,
-                    "repo_key": repo_key,
-                    "owner": info.get("owner"),
-                    "repo": info.get("repo"),
-                    "url": info.get("url"),
-                    "exists_flag": _bool_to_num(info.get("exists")),
-                    "private_flag": _bool_to_num(info.get("private")),
-                    "default_branch": info.get("default_branch"),
-                    "archived_flag": _bool_to_num(info.get("archived")),
-                    "has_main_branch": _bool_to_num(info.get("has_main_branch")),
-                    "has_github_folder": _bool_to_num(info.get("has_github_folder")),
-                    "codeowners_found": _bool_to_num(codeowners.get("found")),
-                    "codeowners_path": codeowners.get("path"),
-                    "rulesets_accessible": _bool_to_num(rulesets.get("accessible")),
-                    "rulesets_count": rulesets.get("count"),
-                    "rulesets_names": ",".join(names) if names else None,
-                    "error_text": info.get("error"),
-                }
-            )
-        if repo_rows:
-            cur.executemany(
-                """
-                INSERT INTO audit_repositories
-                    (run_id, repo_key, owner, repo, url, exists_flag, private_flag,
-                     default_branch, archived_flag, has_main_branch, has_github_folder,
-                     codeowners_found, codeowners_path, rulesets_accessible,
-                     rulesets_count, rulesets_names, error_text)
-                VALUES
-                    (:run_id, :repo_key, :owner, :repo, :url, :exists_flag, :private_flag,
-                     :default_branch, :archived_flag, :has_main_branch, :has_github_folder,
-                     :codeowners_found, :codeowners_path, :rulesets_accessible,
-                     :rulesets_count, :rulesets_names, :error_text)
-                """,
-                repo_rows,
-            )
-
         dep_rows = []
         for entry in result["deployments"]:
             imagestream = entry.get("imagestream") or {}
             github_source = entry.get("github_source") or {}
+            repo = entry.get("repo") or {}
+            codeowners = repo.get("codeowners") or {}
+            rulesets = repo.get("rulesets") or {}
+            names = rulesets.get("names") or []
             dep_rows.append(
                 {
                     "run_id": run_id,
@@ -552,6 +517,21 @@ def save_result_to_db(conn: "cx_Oracle.Connection", result: dict) -> int:
                     "github_detection_method": github_source.get("detection_method"),
                     "github_raw_uri": github_source.get("raw_uri"),
                     "repo_key": entry.get("repo_key"),
+                    "repo_owner": repo.get("owner"),
+                    "repo_name": repo.get("repo"),
+                    "repo_url": repo.get("url"),
+                    "repo_exists": _bool_to_num(repo.get("exists")),
+                    "repo_private": _bool_to_num(repo.get("private")),
+                    "repo_default_branch": repo.get("default_branch"),
+                    "repo_archived": _bool_to_num(repo.get("archived")),
+                    "repo_has_main_branch": _bool_to_num(repo.get("has_main_branch")),
+                    "repo_has_github_folder": _bool_to_num(repo.get("has_github_folder")),
+                    "repo_codeowners_found": _bool_to_num(codeowners.get("found")),
+                    "repo_codeowners_path": codeowners.get("path"),
+                    "repo_rulesets_accessible": _bool_to_num(rulesets.get("accessible")),
+                    "repo_rulesets_count": rulesets.get("count"),
+                    "repo_rulesets_names": ",".join(names) if names else None,
+                    "repo_error": repo.get("error"),
                 }
             )
         if dep_rows:
@@ -560,11 +540,19 @@ def save_result_to_db(conn: "cx_Oracle.Connection", result: dict) -> int:
                 INSERT INTO audit_deployments
                     (run_id, namespace, deployment, container, image, imagestream_name,
                      imagestream_tag, imagestream_match_method, github_detection_method,
-                     github_raw_uri, repo_key)
+                     github_raw_uri, repo_key, repo_owner, repo_name, repo_url,
+                     repo_exists, repo_private, repo_default_branch, repo_archived,
+                     repo_has_main_branch, repo_has_github_folder, repo_codeowners_found,
+                     repo_codeowners_path, repo_rulesets_accessible, repo_rulesets_count,
+                     repo_rulesets_names, repo_error)
                 VALUES
                     (:run_id, :namespace, :deployment, :container, :image, :imagestream_name,
                      :imagestream_tag, :imagestream_match_method, :github_detection_method,
-                     :github_raw_uri, :repo_key)
+                     :github_raw_uri, :repo_key, :repo_owner, :repo_name, :repo_url,
+                     :repo_exists, :repo_private, :repo_default_branch, :repo_archived,
+                     :repo_has_main_branch, :repo_has_github_folder, :repo_codeowners_found,
+                     :repo_codeowners_path, :repo_rulesets_accessible, :repo_rulesets_count,
+                     :repo_rulesets_names, :repo_error)
                 """,
                 dep_rows,
             )
@@ -652,6 +640,7 @@ def main() -> int:
                     "imagestream_match_method": cm["match_method"],
                     "github_source": None,
                     "repo_key": None,
+                    "repo": None,
                 }
 
                 if cm["imagestream"] and cm["tag"]:
@@ -683,6 +672,12 @@ def main() -> int:
                                     "exists": None,
                                     "error": str(exc),
                                 }
+
+                        # Repo embebido en el propio deployment: así cada
+                        # entrada queda autocontenida (deployment + imagestream
+                        # -> repo con toda su info de gobierno), sin depender
+                        # de cruzar con el diccionario "repositories".
+                        entry["repo"] = repo_cache[repo_key]
 
                 deployments_out.append(entry)
 
