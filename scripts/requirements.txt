@@ -1,3 +1,8 @@
 # requests 2.28+ dejó de dar soporte a Python 3.6; 2.27.1 es la última
 # versión compatible con el runner (Python 3.6.8).
 requests>=2.27.1,<2.28
+
+# cx_Oracle 8.3.0 es la última versión que soporta Python 3.6 (el driver
+# sucesor, "oracledb", requiere Python 3.7+). Necesita el Oracle Instant
+# Client instalado en el runner (no funciona en modo "thin puro").
+cx_Oracle==8.3.0

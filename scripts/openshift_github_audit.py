@@ -5,11 +5,21 @@ openshift_github_audit.py
 Recorre namespaces de OpenShift -> Deployments -> ImageStreams/Tags -> intenta
 resolver el repositorio de GitHub de origen de cada imagen, y consulta en
 GitHub metadata de gobierno (rama main, carpeta .github, CODEOWNERS,
-rulesets). Produce un único JSON que asocia cada Deployment con el
-repositorio detectado.
+rulesets). El resultado se escribe además en un JSON local de respaldo, y se
+inserta en una base de datos Oracle (tablas audit_runs, audit_repositories,
+audit_deployments, audit_errors; ver scripts/oracle_schema.sql) en lugar de
+subirse como artefacto a GitHub, ya que el runner no tiene salida a internet.
 
-Requiere que `oc` ya esté logueado en el cluster (oc login previo) y la
-variable de entorno GH_PAT con un token de GitHub.
+Requiere que `oc` ya esté logueado en el cluster (oc login previo), la
+variable de entorno GH_PAT con un token de GitHub, y las variables de
+entorno de conexión a Oracle:
+    DB_ORACLE_USER     -> usuario de la base de datos
+    DB_ORACLE_PASSWORD -> password del usuario
+    DB_ORACLE_DSN      -> cadena de conexión (easy connect), ej.
+                           "dbhost.miempresa.local:1521/ORCLPDB1"
+
+Necesita también tener instalado el Oracle Instant Client en el runner
+(cx_Oracle no funciona en modo "thin puro" con Python 3.6).
 
 Uso:
     python openshift_github_audit.py --output audit-result.json \
@@ -21,6 +31,7 @@ Uso:
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -28,6 +39,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import cx_Oracle
 import requests
 
 # --------------------------------------------------------------------------
@@ -47,7 +59,7 @@ def oc_json(*args: str) -> Any:
     try:
         result = subprocess.run(
             cmd,
-            stdout=subprocess.PIPE,s
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
             check=True,
@@ -424,6 +436,155 @@ class GitHubClient:
 
 
 # --------------------------------------------------------------------------
+# Paso 6: Persistencia del resultado en Oracle (reemplaza la subida como
+# artefacto a GitHub, ya que el runner no tiene salida a internet)
+# --------------------------------------------------------------------------
+
+
+def get_db_connection() -> "cx_Oracle.Connection":
+    """Abre la conexión a Oracle usando credenciales de variables de entorno."""
+    user = os.environ.get("DB_ORACLE_USER")
+    password = os.environ.get("DB_ORACLE_PASSWORD")
+    dsn = os.environ.get("DB_ORACLE_DSN")
+    if not (user and password and dsn):
+        raise RuntimeError(
+            "Faltan variables de entorno DB_ORACLE_USER / DB_ORACLE_PASSWORD / "
+            "DB_ORACLE_DSN para conectar a la base de datos"
+        )
+    return cx_Oracle.connect(user=user, password=password, dsn=dsn)
+
+
+def _bool_to_num(value: Optional[bool]) -> Optional[int]:
+    """Oracle no tiene tipo booleano nativo en tablas normales: NUMBER(1)."""
+    if value is None:
+        return None
+    return 1 if value else 0
+
+
+def save_result_to_db(conn: "cx_Oracle.Connection", result: dict) -> int:
+    """Inserta el resultado completo de la auditoría en Oracle dentro de una
+    única transacción (audit_runs, audit_repositories, audit_deployments,
+    audit_errors). Devuelve el run_id generado. Ver scripts/oracle_schema.sql
+    para el DDL de las tablas."""
+    cur = conn.cursor()
+    try:
+        run_id_var = cur.var(cx_Oracle.NUMBER)
+        cur.execute(
+            """
+            INSERT INTO audit_runs
+                (generated_at, namespaces_scanned, deployment_containers_scanned,
+                 unique_repositories_found, deployment_containers_without_repo)
+            VALUES
+                (:generated_at, :namespaces_scanned, :deployment_containers_scanned,
+                 :unique_repositories_found, :deployment_containers_without_repo)
+            RETURNING run_id INTO :run_id_out
+            """,
+            {
+                "generated_at": datetime.fromisoformat(result["generated_at"]),
+                "namespaces_scanned": result["summary"]["namespaces_scanned"],
+                "deployment_containers_scanned": result["summary"]["deployment_containers_scanned"],
+                "unique_repositories_found": result["summary"]["unique_repositories_found"],
+                "deployment_containers_without_repo": result["summary"][
+                    "deployment_containers_without_repo"
+                ],
+                "run_id_out": run_id_var,
+            },
+        )
+        run_id = int(run_id_var.getvalue()[0])
+
+        repo_rows = []
+        for repo_key, info in result["repositories"].items():
+            codeowners = info.get("codeowners") or {}
+            rulesets = info.get("rulesets") or {}
+            names = rulesets.get("names") or []
+            repo_rows.append(
+                {
+                    "run_id": run_id,
+                    "repo_key": repo_key,
+                    "owner": info.get("owner"),
+                    "repo": info.get("repo"),
+                    "url": info.get("url"),
+                    "exists_flag": _bool_to_num(info.get("exists")),
+                    "private_flag": _bool_to_num(info.get("private")),
+                    "default_branch": info.get("default_branch"),
+                    "archived_flag": _bool_to_num(info.get("archived")),
+                    "has_main_branch": _bool_to_num(info.get("has_main_branch")),
+                    "has_github_folder": _bool_to_num(info.get("has_github_folder")),
+                    "codeowners_found": _bool_to_num(codeowners.get("found")),
+                    "codeowners_path": codeowners.get("path"),
+                    "rulesets_accessible": _bool_to_num(rulesets.get("accessible")),
+                    "rulesets_count": rulesets.get("count"),
+                    "rulesets_names": ",".join(names) if names else None,
+                    "error_text": info.get("error"),
+                }
+            )
+        if repo_rows:
+            cur.executemany(
+                """
+                INSERT INTO audit_repositories
+                    (run_id, repo_key, owner, repo, url, exists_flag, private_flag,
+                     default_branch, archived_flag, has_main_branch, has_github_folder,
+                     codeowners_found, codeowners_path, rulesets_accessible,
+                     rulesets_count, rulesets_names, error_text)
+                VALUES
+                    (:run_id, :repo_key, :owner, :repo, :url, :exists_flag, :private_flag,
+                     :default_branch, :archived_flag, :has_main_branch, :has_github_folder,
+                     :codeowners_found, :codeowners_path, :rulesets_accessible,
+                     :rulesets_count, :rulesets_names, :error_text)
+                """,
+                repo_rows,
+            )
+
+        dep_rows = []
+        for entry in result["deployments"]:
+            imagestream = entry.get("imagestream") or {}
+            github_source = entry.get("github_source") or {}
+            dep_rows.append(
+                {
+                    "run_id": run_id,
+                    "namespace": entry["namespace"],
+                    "deployment": entry["deployment"],
+                    "container": entry["container"],
+                    "image": entry.get("image"),
+                    "imagestream_name": imagestream.get("name"),
+                    "imagestream_tag": imagestream.get("tag"),
+                    "imagestream_match_method": entry.get("imagestream_match_method"),
+                    "github_detection_method": github_source.get("detection_method"),
+                    "github_raw_uri": github_source.get("raw_uri"),
+                    "repo_key": entry.get("repo_key"),
+                }
+            )
+        if dep_rows:
+            cur.executemany(
+                """
+                INSERT INTO audit_deployments
+                    (run_id, namespace, deployment, container, image, imagestream_name,
+                     imagestream_tag, imagestream_match_method, github_detection_method,
+                     github_raw_uri, repo_key)
+                VALUES
+                    (:run_id, :namespace, :deployment, :container, :image, :imagestream_name,
+                     :imagestream_tag, :imagestream_match_method, :github_detection_method,
+                     :github_raw_uri, :repo_key)
+                """,
+                dep_rows,
+            )
+
+        if result["errors"]:
+            cur.executemany(
+                "INSERT INTO audit_errors (run_id, error_text) VALUES (:run_id, :error_text)",
+                [{"run_id": run_id, "error_text": e[:4000]} for e in result["errors"]],
+            )
+
+        conn.commit()
+        return run_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+
+
+# --------------------------------------------------------------------------
 # Orquestación principal
 # --------------------------------------------------------------------------
 
@@ -434,13 +595,25 @@ def main() -> int:
     parser.add_argument("--exclude-prefixes", default="openshift-,kube-")
     parser.add_argument("--exclude-exact", default="default,openshift,kube-system,kube-public,kube-node-lease")
     parser.add_argument("--github-api-url", default="https://api.github.com")
+    parser.add_argument(
+        "--skip-db",
+        action="store_true",
+        help="No insertar el resultado en Oracle (solo escribir el JSON local; útil para pruebas)",
+    )
     args = parser.parse_args()
-
-    import os
 
     gh_token = os.environ.get("GH_PAT")
     if not gh_token:
         log("ERROR: falta la variable de entorno GH_PAT")
+        return 1
+
+    if not args.skip_db and not all(
+        os.environ.get(v) for v in ("DB_ORACLE_USER", "DB_ORACLE_PASSWORD", "DB_ORACLE_DSN")
+    ):
+        log(
+            "ERROR: faltan variables de entorno DB_ORACLE_USER / DB_ORACLE_PASSWORD / "
+            "DB_ORACLE_DSN (usa --skip-db para omitir la inserción en base de datos)"
+        )
         return 1
 
     exclude_prefixes = [p.strip() for p in args.exclude_prefixes.split(",") if p.strip()]
@@ -541,6 +714,25 @@ def main() -> int:
     if errors:
         log(f"Se registraron {len(errors)} advertencias/errores no fatales (ver campo 'errors' del JSON)")
 
+    if args.skip_db:
+        log("--skip-db activo: se omite la inserción en Oracle")
+        return 0
+
+    try:
+        conn = get_db_connection()
+    except Exception as exc:
+        log(f"ERROR: no se pudo conectar a la base de datos: {exc}")
+        return 1
+
+    try:
+        run_id = save_result_to_db(conn, result)
+    except Exception as exc:
+        log(f"ERROR: falló la inserción del resultado en la base de datos: {exc}")
+        return 1
+    finally:
+        conn.close()
+
+    log(f"Resultado insertado en Oracle (audit_runs.run_id={run_id})")
     return 0
 
 

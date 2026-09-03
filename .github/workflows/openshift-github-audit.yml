@@ -11,6 +11,10 @@ name: OpenShift → GitHub Governance Audit
 #   - CLI `oc` instalado (o el paso "Ensure oc CLI" lo descarga en Linux)
 #   - Python 3.11+
 #
+# El resultado se inserta directamente en Oracle (ver scripts/oracle_schema.sql)
+# en vez de subirse como artefacto de GitHub Actions, ya que el runner no
+# tiene salida a internet.
+#
 # Secrets requeridos (a nivel de repo u organización):
 #   OPENSHIFT_SERVER  -> URL del API server, ej. https://api.cluster.example.com:6443
 #   OPENSHIFT_TOKEN   -> Token de una ServiceAccount con permisos de lectura
@@ -19,6 +23,10 @@ name: OpenShift → GitHub Governance Audit
 #   GH_PAT            -> Personal Access Token de GitHub con permisos de
 #                        lectura de contenido y "Administration: read" (para
 #                        poder listar rulesets) en los repos a inspeccionar.
+#   DB_ORACLE_USER     -> Usuario de la base de datos Oracle destino.
+#   DB_ORACLE_PASSWORD -> Password de ese usuario.
+#   DB_ORACLE_DSN      -> Cadena de conexión (easy connect), ej.
+#                         "dbhost.miempresa.local:1521/ORCLPDB1".
 #
 # Variables opcionales (Settings > Actions > Variables):
 #   OPENSHIFT_SKIP_TLS_VERIFY -> "true" si el cluster usa certificados
@@ -91,23 +99,19 @@ jobs:
           fi
           oc whoami
 
-      - name: Ejecutar auditoría OpenShift → GitHub
+      - name: Ejecutar auditoría OpenShift → GitHub e insertar en Oracle
         shell: bash
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           GITHUB_API_URL: ${{ vars.GITHUB_API_URL || 'https://api.github.com' }}
           NAMESPACE_EXCLUDE_PREFIXES: ${{ github.event.inputs.namespace_exclude_prefixes || 'openshift-,kube-' }}
           NAMESPACE_EXCLUDE_EXACT: ${{ github.event.inputs.namespace_exclude_exact || 'default,openshift,kube-system,kube-public,kube-node-lease' }}
+          DB_ORACLE_USER: ${{ secrets.DB_ORACLE_USER }}
+          DB_ORACLE_PASSWORD: ${{ secrets.DB_ORACLE_PASSWORD }}
+          DB_ORACLE_DSN: ${{ secrets.DB_ORACLE_DSN }}
         run: |
           python scripts/openshift_github_audit.py \
             --output audit-result.json \
             --exclude-prefixes "$NAMESPACE_EXCLUDE_PREFIXES" \
             --exclude-exact "$NAMESPACE_EXCLUDE_EXACT" \
             --github-api-url "$GITHUB_API_URL"
-
-      - name: Subir resultado como artefacto
-        uses: actions/upload-artifact@v4
-        with:
-          name: openshift-github-audit-${{ github.run_id }}
-          path: audit-result.json
-          retention-days: 30
