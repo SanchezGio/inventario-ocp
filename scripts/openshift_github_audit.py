@@ -79,6 +79,42 @@ def oc_json(*args: str) -> Any:
         return None
 
 
+def oc_image_info(image: str) -> Optional[dict]:
+    """Ejecuta `oc image info <image> -o json` inspeccionando la imagen
+    directamente en su registry (interno o externo), sin pasar por
+    ImageStream/BuildConfig. Sirve para imágenes construidas por CI externo
+    a OpenShift que hornean labels OCI (org.opencontainers.image.source) en
+    el build. Si la imagen es un manifest list (multi-arch), reintenta con
+    --filter-by-os. Si el registry no es alcanzable (p.ej. uno externo
+    sin salida a internet desde el runner) o no hay permisos, devuelve
+    None silenciosamente en vez de abortar el pipeline."""
+    base_cmd = ["oc", "image", "info", image, "--insecure", "-o", "json"]
+    for cmd in (base_cmd, base_cmd + ["--filter-by-os=linux/amd64"]):
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                check=True,
+                timeout=60,
+            )
+            return json.loads(result.stdout)
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").lower()
+            if "manifest list" in stderr or "filter-by-os" in stderr:
+                continue  # reintenta con --filter-by-os
+            log(f"WARN: 'oc image info {image}' falló: {(exc.stderr or '').strip()[:300]}")
+            return None
+        except subprocess.TimeoutExpired:
+            log(f"WARN: timeout ejecutando 'oc image info {image}'")
+            return None
+        except json.JSONDecodeError as exc:
+            log(f"WARN: respuesta no-JSON de 'oc image info {image}': {exc}")
+            return None
+    return None
+
+
 # --------------------------------------------------------------------------
 # Paso 1-2: Namespaces y Deployments
 # --------------------------------------------------------------------------
@@ -366,6 +402,46 @@ def find_source_via_image_labels(namespace: str, imagestream: str, tag: str) -> 
     return None
 
 
+def _extract_image_info_labels(data: dict) -> Dict[str, str]:
+    """`oc image info -o json` ha tenido distintas formas de anidar el
+    Config.Labels según la versión del CLI; se prueban las rutas conocidas
+    en vez de asumir una sola."""
+    for path in (("config", "config", "Labels"), ("config", "Labels"), ("Config", "Labels")):
+        node: Any = data
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+            if node is None:
+                break
+        if isinstance(node, dict):
+            return node
+    return {}
+
+
+def find_source_via_image_info(image: str) -> Optional[dict]:
+    """Último fallback: inspecciona la imagen directamente con
+    `oc image info` (sin ImageStream ni BuildConfig de por medio), para
+    leer la label OCI estándar que hornean los pipelines de CI externos a
+    OpenShift (Jenkins, Tekton, GitHub Actions, etc.)."""
+    if not image:
+        return None
+    data = oc_image_info(image)
+    if not data:
+        return None
+    labels = _extract_image_info_labels(data)
+    for key in ("org.opencontainers.image.source", "io.openshift.build.source-location"):
+        value = labels.get(key)
+        if value:
+            repo = extract_github_repo(value)
+            if repo:
+                return {
+                    "owner": repo[0],
+                    "repo": repo[1],
+                    "raw_uri": value,
+                    "detection_method": f"image-info-label:{key}",
+                }
+    return None
+
+
 def find_github_source(
     namespace: str, image: str, imagestream: Optional[str], tag: Optional[str], cache: NamespaceCache
 ) -> Optional[dict]:
@@ -375,7 +451,10 @@ def find_github_source(
     anotaciones, labels de la imagen). Si no hay ImageStream (apps cuyo
     BuildConfig empuja directo al registry con output.to.kind=DockerImage),
     o si esos métodos no encontraron nada, cae a comparar la imagen del
-    contenedor directo contra el output de los BuildConfigs del namespace."""
+    contenedor directo contra el output de los BuildConfigs del namespace,
+    y como último recurso a inspeccionar la imagen misma (para apps
+    construidas por CI externo a OpenShift, sin BuildConfig ni ImageStream
+    en el cluster)."""
     finders = []
     if imagestream and tag:
         finders.extend(
@@ -386,12 +465,41 @@ def find_github_source(
             ]
         )
     finders.append(lambda: find_source_via_buildconfig_direct_image(namespace, image, cache))
+    finders.append(lambda: find_source_via_image_info(image))
 
     for finder in finders:
         result = finder()
         if result:
             return result
     return None
+
+
+def log_unmatched_diagnostics(namespace: str, dep_name: str, cm: dict, cache: NamespaceCache) -> None:
+    """Con --debug-unmatched: cuando un contenedor queda sin repo, imprime
+    qué BuildConfigs/ImageStreams hay en su namespace y sus outputs, para
+    poder comparar a mano contra la imagen del contenedor y entender por
+    qué ningún método de find_github_source hizo match."""
+    log(
+        f"DEBUG sin repo: {namespace}/{dep_name}/{cm['container']} "
+        f"imagen={cm['image']!r} imagestream={cm['imagestream']!r} tag={cm['tag']!r}"
+    )
+    bcs = cache.buildconfigs(namespace)
+    if not bcs:
+        log(f"DEBUG   namespace '{namespace}': no hay BuildConfigs")
+    else:
+        for bc in bcs:
+            out = bc.get("spec", {}).get("output", {}).get("to", {})
+            git_uri = bc.get("spec", {}).get("source", {}).get("git", {}).get("uri")
+            log(
+                f"DEBUG   buildconfig={bc['metadata']['name']} "
+                f"output.kind={out.get('kind')!r} output.name={out.get('name')!r} "
+                f"source.git.uri={git_uri!r}"
+            )
+    streams = cache.imagestreams(namespace)
+    if not streams:
+        log(f"DEBUG   namespace '{namespace}': no hay ImageStreams")
+    else:
+        log(f"DEBUG   namespace '{namespace}': ImageStreams = {[s['metadata']['name'] for s in streams]}")
 
 
 # --------------------------------------------------------------------------
@@ -647,6 +755,15 @@ def main() -> int:
         action="store_true",
         help="No insertar el resultado en Oracle (solo escribir el JSON local; útil para pruebas)",
     )
+    parser.add_argument(
+        "--debug-unmatched",
+        action="store_true",
+        help=(
+            "Por cada contenedor que quede sin repo detectado, imprime en el log "
+            "qué BuildConfigs/ImageStreams existen en su namespace y qué output "
+            "tienen, para diagnosticar por qué ningún método hizo match."
+        ),
+    )
     args = parser.parse_args()
 
     gh_token = os.environ.get("GH_PAT")
@@ -740,6 +857,9 @@ def main() -> int:
                         # -> repo con toda su info de gobierno), sin depender
                         # de cruzar con el diccionario "repositories".
                         entry["repo"] = repo_cache[repo_key]
+
+                if not entry["repo_key"] and args.debug_unmatched:
+                    log_unmatched_diagnostics(ns, dep_name, cm, cache)
 
                 deployments_out.append(entry)
 
