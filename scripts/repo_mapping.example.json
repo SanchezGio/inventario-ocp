@@ -1,0 +1,9 @@
+{
+  "_comment": "Plantilla de ejemplo. Copiar a scripts/repo_mapping.json y completar con los namespace/deployment que el script no logra resolver automáticamente (ver --debug-unmatched). El script ignora esta clave '_comment' porque no es un namespace/deployment real, solo se deja como nota; bórrala si prefieres un archivo limpio.",
+
+  "credivirtual-prod/crediypy-card-manager": "credibanco-repositories/crediypy-card-manager",
+  "credivirtual-prod/crediypy-gateway": "credibanco-repositories/crediypy-gateway",
+
+  "_comment_container": "Si un Deployment tiene varios contenedores que van a repos distintos, se puede ser más específico agregando el nombre del contenedor:",
+  "namespace-ejemplo/deployment-ejemplo/nombre-del-contenedor": "credibanco-repositories/otro-repo"
+}

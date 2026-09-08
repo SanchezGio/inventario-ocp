@@ -17,6 +17,10 @@ verifica su estado de gobierno (rama `main`, carpeta `.github`,
    ImageStream (su BuildConfig empuja directo al registry, o se
    construyen fuera de OpenShift).
 4. Intenta ubicar el repositorio de GitHub de origen probando, en orden:
+   0. **Mapeo manual** (`scripts/repo_mapping.json`, ver más abajo): si hay
+      una entrada `namespace/deployment -> owner/repo`, se usa
+      directamente y no se corre ninguna heurística automática. Es la
+      fuente de mayor prioridad.
    1. El `BuildConfig` cuyo output apunta a ese ImageStreamTag
       (`spec.source.git.uri`).
    2. Anotaciones del ImageStream/tag.
@@ -29,6 +33,13 @@ verifica su estado de gobierno (rama `main`, carpeta `.github`,
       independiente de ImageStream/BuildConfig —, para leer la label OCI
       `org.opencontainers.image.source` horneada por pipelines de CI
       externos a OpenShift (Jenkins, Tekton, GitHub Actions, etc.).
+
+   Los pasos 1-5 son heurísticas automáticas que dependen de que exista
+   **alguna señal en el cluster** (BuildConfig, label o anotación). Si el
+   deployment se despliega vía CI externo sin BuildConfig, sin GitOps y
+   sin hornear esas labels/anotaciones en la imagen, **no hay ninguna
+   señal que leer** — en ese caso la única forma de asociarlo es el
+   mapeo manual del paso 0.
 5. Por cada repositorio único encontrado, consulta la API de GitHub:
    URL, si existe rama `main`, si tiene carpeta `.github`, si tiene
    `CODEOWNERS` (raíz, `.github/` o `docs/`) y sus `rulesets`.
@@ -97,6 +108,34 @@ Para diagnosticar namespaces donde el repo sigue quedando `null`, agrega
 `--debug-unmatched`: por cada contenedor sin repo, imprime en el log qué
 BuildConfigs/ImageStreams existen en su namespace y qué `output`/`source`
 tienen, para comparar a mano contra la imagen del contenedor.
+
+## Mapeo manual (`scripts/repo_mapping.json`)
+
+Cuando `--debug-unmatched` confirma que un deployment no tiene ninguna
+señal automática detectable (sin BuildConfig, sin labels/anotaciones, sin
+ImageStream con output reconocible), la única forma de asociarlo a su
+repo es declararlo a mano:
+
+1. Copia `scripts/repo_mapping.example.json` a `scripts/repo_mapping.json`.
+2. Agrega una entrada por cada `namespace/deployment` que necesites, con
+   el `owner/repo` real:
+   ```json
+   {
+     "credivirtual-prod/crediypy-card-manager": "credibanco-repositories/crediypy-card-manager",
+     "credivirtual-prod/crediypy-gateway": "credibanco-repositories/crediypy-gateway"
+   }
+   ```
+   Si un Deployment tiene varios contenedores que van a repos distintos,
+   se puede ser más específico con `namespace/deployment/container`.
+3. Commitea `scripts/repo_mapping.json` al repo (así el workflow lo
+   encuentra automáticamente en `--repo-mapping-file`, que por default
+   apunta a esa ruta relativa al checkout).
+
+Una entrada en este archivo tiene **prioridad total**: si existe, se usa
+directamente y el deployment no pasa por ninguna de las heurísticas
+automáticas (queda con `github_source.detection_method: "manual-mapping"`
+en el JSON/Oracle). El archivo es opcional — si no existe, el script
+simplemente lo ignora y sigue con las heurísticas automáticas.
 
 ## Limitaciones conocidas
 

@@ -740,6 +740,54 @@ def save_result_to_db(conn: "cx_Oracle.Connection", result: dict) -> int:
 
 
 # --------------------------------------------------------------------------
+# Mapeo manual namespace/deployment -> owner/repo
+#
+# Para las apps que no tienen ninguna señal en OpenShift (sin BuildConfig,
+# sin labels S2I/OCI en la imagen, sin convención de nombres, sin GitOps),
+# no hay forma de inferir el repo automáticamente. Este mapeo es la fuente
+# de mayor prioridad: si existe una entrada, se usa directamente y no se
+# corre ninguna heurística automática para ese contenedor.
+# --------------------------------------------------------------------------
+
+
+def load_repo_mapping(path: Optional[str]) -> Dict[str, str]:
+    """Carga el JSON de mapeo manual. Formato:
+        {
+          "namespace/deployment": "owner/repo",
+          "namespace/deployment/container": "owner/repo"
+        }
+    La clave con container es para el caso poco común de un Deployment con
+    varios contenedores que van a repos distintos; si no se especifica, se
+    usa "namespace/deployment" para todos sus contenedores.
+    Es opcional: si el archivo no existe, se continúa sin mapeo manual
+    (no es un error, ya que la mayoría de las corridas no lo necesitan)."""
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        log(f"No hay archivo de mapeo manual en '{path}' (opcional); se continúa sin él")
+        return {}
+    except json.JSONDecodeError as exc:
+        log(f"WARN: '{path}' no es JSON válido ({exc}); se continúa sin mapeo manual")
+        return {}
+    if not isinstance(data, dict) or not all(isinstance(v, str) for v in data.values()):
+        log(f"WARN: '{path}' debe ser un objeto JSON {{'ns/deployment': 'owner/repo'}}; se ignora")
+        return {}
+    log(f"Mapeo manual cargado desde '{path}': {len(data)} entrada(s)")
+    return data
+
+
+def lookup_repo_mapping(mapping: Dict[str, str], namespace: str, deployment: str, container: str) -> Optional[str]:
+    for key in (f"{namespace}/{deployment}/{container}", f"{namespace}/{deployment}"):
+        value = mapping.get(key)
+        if value:
+            return value
+    return None
+
+
+# --------------------------------------------------------------------------
 # Orquestación principal
 # --------------------------------------------------------------------------
 
@@ -762,6 +810,17 @@ def main() -> int:
             "Por cada contenedor que quede sin repo detectado, imprime en el log "
             "qué BuildConfigs/ImageStreams existen en su namespace y qué output "
             "tienen, para diagnosticar por qué ningún método hizo match."
+        ),
+    )
+    parser.add_argument(
+        "--repo-mapping-file",
+        default="scripts/repo_mapping.json",
+        help=(
+            "JSON con el mapeo manual namespace/deployment -> owner/repo, para "
+            "las apps sin ninguna señal automática detectable en OpenShift. Se "
+            "consulta con máxima prioridad, antes que cualquier heurística "
+            "automática. Opcional: si el archivo no existe, se ignora. Ver "
+            "scripts/repo_mapping.example.json."
         ),
     )
     args = parser.parse_args()
@@ -788,6 +847,7 @@ def main() -> int:
     repo_cache: Dict[str, dict] = {}  # "owner/repo" -> repo_audit result
     deployments_out: List[dict] = []
     errors: List[str] = []
+    repo_mapping = load_repo_mapping(args.repo_mapping_file)
 
     namespaces = list_namespaces(exclude_prefixes, exclude_exact)
 
@@ -819,10 +879,31 @@ def main() -> int:
                     "repo": None,
                 }
 
-                # Se intenta buscar el repo aunque no se haya resuelto un
-                # ImageStream (ver find_source_via_buildconfig_direct_image):
-                # hay apps cuyo BuildConfig empuja directo al registry.
-                if cm["image"] or (cm["imagestream"] and cm["tag"]):
+                # Prioridad 1: mapeo manual (namespace/deployment -> owner/repo).
+                # Se usa tal cual, sin correr ninguna heurística automática,
+                # porque es la fuente más confiable para los casos sin ninguna
+                # señal detectable en OpenShift.
+                mapped = lookup_repo_mapping(repo_mapping, ns, dep_name, cm["container"])
+                source: Optional[dict] = None
+                if mapped:
+                    if "/" in mapped:
+                        owner, repo_name = mapped.split("/", 1)
+                        source = {
+                            "owner": owner,
+                            "repo": repo_name,
+                            "raw_uri": mapped,
+                            "detection_method": "manual-mapping",
+                        }
+                    else:
+                        errors.append(
+                            f"{ns}/{dep_name}/{cm['container']}: entrada de mapeo manual inválida "
+                            f"'{mapped}' (debe ser 'owner/repo')"
+                        )
+                # Prioridad 2: heurísticas automáticas. Se intenta buscar el
+                # repo aunque no se haya resuelto un ImageStream (ver
+                # find_source_via_buildconfig_direct_image): hay apps cuyo
+                # BuildConfig empuja directo al registry.
+                elif cm["image"] or (cm["imagestream"] and cm["tag"]):
                     try:
                         source = find_github_source(ns, cm["image"], cm["imagestream"], cm["tag"], cache)
                     except Exception as exc:
@@ -831,32 +912,32 @@ def main() -> int:
                         )
                         source = None
 
-                    if source:
-                        entry["github_source"] = {
-                            "detection_method": source["detection_method"],
-                            "raw_uri": source["raw_uri"],
-                        }
-                        repo_key = f"{source['owner']}/{source['repo']}"
-                        entry["repo_key"] = repo_key
+                if source:
+                    entry["github_source"] = {
+                        "detection_method": source["detection_method"],
+                        "raw_uri": source["raw_uri"],
+                    }
+                    repo_key = f"{source['owner']}/{source['repo']}"
+                    entry["repo_key"] = repo_key
 
-                        if repo_key not in repo_cache:
-                            log(f"Consultando GitHub: {repo_key}")
-                            try:
-                                repo_cache[repo_key] = gh.repo_audit(source["owner"], source["repo"])
-                            except Exception as exc:
-                                errors.append(f"{repo_key}: error consultando GitHub: {exc}")
-                                repo_cache[repo_key] = {
-                                    "owner": source["owner"],
-                                    "repo": source["repo"],
-                                    "exists": None,
-                                    "error": str(exc),
-                                }
+                    if repo_key not in repo_cache:
+                        log(f"Consultando GitHub: {repo_key}")
+                        try:
+                            repo_cache[repo_key] = gh.repo_audit(source["owner"], source["repo"])
+                        except Exception as exc:
+                            errors.append(f"{repo_key}: error consultando GitHub: {exc}")
+                            repo_cache[repo_key] = {
+                                "owner": source["owner"],
+                                "repo": source["repo"],
+                                "exists": None,
+                                "error": str(exc),
+                            }
 
-                        # Repo embebido en el propio deployment: así cada
-                        # entrada queda autocontenida (deployment + imagestream
-                        # -> repo con toda su info de gobierno), sin depender
-                        # de cruzar con el diccionario "repositories".
-                        entry["repo"] = repo_cache[repo_key]
+                    # Repo embebido en el propio deployment: así cada
+                    # entrada queda autocontenida (deployment + imagestream
+                    # -> repo con toda su info de gobierno), sin depender
+                    # de cruzar con el diccionario "repositories".
+                    entry["repo"] = repo_cache[repo_key]
 
                 if not entry["repo_key"] and args.debug_unmatched:
                     log_unmatched_diagnostics(ns, dep_name, cm, cache)
