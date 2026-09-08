@@ -376,6 +376,24 @@ def find_source_via_imagestream_annotations(
     return None
 
 
+# Repos que sabemos son de una imagen BASE pública (ej. el OpenJDK de Red
+# Hat), no del código propio de la app: cuando un build S2I no sobreescribe
+# la label org.opencontainers.image.source en su propia imagen, esta queda
+# heredada tal cual de la imagen base y termina apuntando al repo público
+# de esa base en vez de al repo real de la app. Confirmado empíricamente:
+# esta label aparecía idéntica en decenas de apps sin relación entre sí
+# (credibanco-plus-*, jarvis-*, mark1-orchestrator, etc.), evidencia clara
+# de que es heredada, no propia. Mejor devolver null (y que quede para
+# mapeo manual) que un repo confiadamente incorrecto en la base de datos.
+KNOWN_BASE_IMAGE_REPOS = {
+    ("rh-openjdk", "redhat-openjdk-containers"),
+}
+
+
+def _is_base_image_repo(owner: str, repo: str) -> bool:
+    return (owner.lower(), repo.lower()) in KNOWN_BASE_IMAGE_REPOS
+
+
 def find_source_via_image_labels(namespace: str, imagestream: str, tag: str) -> Optional[dict]:
     istag = oc_json("get", "imagestreamtag", f"{imagestream}:{tag}", "-n", namespace)
     if not istag:
@@ -392,7 +410,7 @@ def find_source_via_image_labels(namespace: str, imagestream: str, tag: str) -> 
         value = labels.get(key)
         if value:
             repo = extract_github_repo(value)
-            if repo:
+            if repo and not _is_base_image_repo(*repo):
                 return {
                     "owner": repo[0],
                     "repo": repo[1],
@@ -417,12 +435,31 @@ def _extract_image_info_labels(data: dict) -> Dict[str, str]:
     return {}
 
 
+def _is_cluster_internal_host(image: str) -> bool:
+    """True si el host de la referencia de imagen es un nombre DNS interno
+    del cluster (un Service de Kubernetes, ej. terminado en '.svc' o
+    '.svc.cluster.local', como 'image-registry.openshift-image-registry.svc:5000').
+    Ese tipo de nombre solo es resoluble/ruteable DESDE DENTRO del cluster.
+    Si el runner que ejecuta este script está fuera del cluster (con acceso
+    solo al API server, no a la red de pods/servicios), nunca podrá
+    alcanzarlo — confirmado empíricamente: todas las llamadas a ese host
+    fallaban con error de DNS/proxy, mientras que hosts públicos (p.ej.
+    registry.redhat.io) sí respondían bien. Evita intentar (y loguear
+    ruido de) llamadas que sabemos de antemano que van a fallar."""
+    if not image or "/" not in image:
+        return False
+    host = image.split("/", 1)[0].split(":", 1)[0]
+    return host.endswith(".svc") or ".svc." in host
+
+
 def find_source_via_image_info(image: str) -> Optional[dict]:
     """Último fallback: inspecciona la imagen directamente con
     `oc image info` (sin ImageStream ni BuildConfig de por medio), para
     leer la label OCI estándar que hornean los pipelines de CI externos a
-    OpenShift (Jenkins, Tekton, GitHub Actions, etc.)."""
-    if not image:
+    OpenShift (Jenkins, Tekton, GitHub Actions, etc.). Solo tiene sentido
+    para imágenes en un registry externo alcanzable por el runner (ver
+    _is_cluster_internal_host)."""
+    if not image or _is_cluster_internal_host(image):
         return None
     data = oc_image_info(image)
     if not data:
@@ -432,7 +469,7 @@ def find_source_via_image_info(image: str) -> Optional[dict]:
         value = labels.get(key)
         if value:
             repo = extract_github_repo(value)
-            if repo:
+            if repo and not _is_base_image_repo(*repo):
                 return {
                     "owner": repo[0],
                     "repo": repo[1],

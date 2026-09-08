@@ -146,11 +146,22 @@ simplemente lo ignora y sigue con las heurísticas automáticas.
   deployment queda registrado igual pero con `repo: null` y
   `repo_key: null`. Esto es esperado, no un bug: no todo deployment tiene
   un repo de la organización detrás.
-- El fallback de `oc image info` requiere que el runner pueda alcanzar el
-  registry de la imagen (el interno del cluster siempre debería ser
-  alcanzable; uno externo como Docker Hub o Quay puede no serlo si el
-  runner no tiene salida a internet, en cuyo caso ese método simplemente
-  no encuentra nada para esas imágenes).
+- **`oc image info` NUNCA puede alcanzar el registry interno del cluster**
+  (`image-registry.<...>.svc:5000` y similares) desde un runner que está
+  *fuera* del cluster: es un nombre DNS de Service de Kubernetes, solo
+  resoluble desde dentro de la red de pods. El script detecta esto
+  automáticamente (`_is_cluster_internal_host`) y ni siquiera lo intenta
+  para esos hosts — sí lo intenta para registries externos (Quay, Docker
+  Hub, `registry.redhat.io`) alcanzables por internet normal.
+- Las labels `org.opencontainers.image.source` / `io.openshift.build.source-location`
+  de la imagen pueden venir **heredadas de la imagen base** (p.ej. un build
+  S2I sobre `rh-openjdk` que no sobreescribe la label en su propia imagen),
+  apuntando entonces al repo público de esa base y no al repo real de la
+  app. El script excluye coincidencias contra una lista de repos de imagen
+  base conocidos (`KNOWN_BASE_IMAGE_REPOS`, en `openshift_github_audit.py`)
+  para no insertar un repo confiadamente incorrecto — si ves otro caso
+  similar (una misma coincidencia repetida en apps sin relación entre sí),
+  agrégalo a esa lista.
 - El campo `has_main_branch` verifica una rama llamada literalmente
   `main` (no el `default_branch` configurado del repo).
 - Los rulesets requieren permisos de administración sobre el repo; si el
