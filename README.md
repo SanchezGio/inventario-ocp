@@ -20,26 +20,36 @@ verifica su estado de gobierno (rama `main`, carpeta `.github`,
    0. **Mapeo manual** (`scripts/repo_mapping.json`, ver más abajo): si hay
       una entrada `namespace/deployment -> owner/repo`, se usa
       directamente y no se corre ninguna heurística automática. Es la
-      fuente de mayor prioridad.
-   1. El `BuildConfig` cuyo output apunta a ese ImageStreamTag
+      fuente de mayor prioridad — pero requiere que alguien ya sepa esa
+      asociación; no sirve para descubrirla desde cero.
+   1. **Anotaciones/labels del propio `Deployment`** (y de su pod
+      template) — no cuesta ninguna llamada extra, el objeto ya está en
+      memoria. Cubre pipelines de CI/CD (GitOps, Helm, un script propio)
+      que estampan el repo de origen ahí al desplegar.
+   2. El `BuildConfig` cuyo output apunta a ese ImageStreamTag
       (`spec.source.git.uri`).
-   2. Anotaciones del ImageStream/tag.
-   3. Labels S2I horneadas en la imagen, vía `ImageStreamTag`
-      (`io.openshift.build.source-location`, `org.opencontainers.image.source`).
-   4. Comparar la imagen del contenedor directo contra el `output` de los
+   3. Anotaciones del ImageStream/tag.
+   4. Labels S2I y variable `OPENSHIFT_BUILD_SOURCE` horneadas en la
+      imagen, vía `ImageStreamTag` (`io.openshift.build.source-location`,
+      `org.opencontainers.image.source`, `Config.Env`).
+   5. Comparar la imagen del contenedor directo contra el `output` de los
       BuildConfigs del namespace (soporta `output.to.kind: DockerImage`,
       para apps sin ImageStream).
-   5. Como último recurso, `oc image info` sobre la imagen misma —
-      independiente de ImageStream/BuildConfig —, para leer la label OCI
-      `org.opencontainers.image.source` horneada por pipelines de CI
-      externos a OpenShift (Jenkins, Tekton, GitHub Actions, etc.).
+   6. Como último recurso, `oc image info` sobre la imagen misma —
+      independiente de ImageStream/BuildConfig —, para leer las mismas
+      labels/env horneadas por pipelines de CI externos a OpenShift
+      (Jenkins, Tekton, GitHub Actions, etc.), en registries externos
+      alcanzables por el runner.
 
-   Los pasos 1-5 son heurísticas automáticas que dependen de que exista
-   **alguna señal en el cluster** (BuildConfig, label o anotación). Si el
-   deployment se despliega vía CI externo sin BuildConfig, sin GitOps y
-   sin hornear esas labels/anotaciones en la imagen, **no hay ninguna
-   señal que leer** — en ese caso la única forma de asociarlo es el
-   mapeo manual del paso 0.
+   Los pasos 1-6 son heurísticas automáticas que dependen de que exista
+   **alguna señal en el cluster** (Deployment, BuildConfig, label,
+   anotación o variable de entorno). Si el deployment se despliega vía CI
+   externo sin BuildConfig, sin GitOps, sin hornear esas
+   labels/env/anotaciones y sin estampar nada en el propio Deployment,
+   **no hay ninguna señal que leer** en OpenShift — corre con
+   `--debug-unmatched` para confirmarlo caso por caso, y en ese punto la
+   única forma de asociarlo es completar el mapeo manual con quien sepa
+   la respuesta (el equipo dueño de esa app).
 5. Por cada repositorio único encontrado, consulta la API de GitHub:
    URL, si existe rama `main`, si tiene carpeta `.github`, si tiene
    `CODEOWNERS` (raíz, `.github/` o `docs/`) y sus `rulesets`.
@@ -136,6 +146,31 @@ directamente y el deployment no pasa por ninguna de las heurísticas
 automáticas (queda con `github_source.detection_method: "manual-mapping"`
 en el JSON/Oracle). El archivo es opcional — si no existe, el script
 simplemente lo ignora y sigue con las heurísticas automáticas.
+
+También soporta una clave `imagestream:namespace/nombre-del-imagestream`,
+más económica que `namespace/deployment` cuando varios Deployments
+comparten el mismo ImageStream (típico de réplicas/colas con sufijo
+numérico, ej. `socket-connection-dcc-1`..`-10`): una sola entrada cubre a
+todos. Prioridad de lookup: `namespace/deployment/container` >
+`namespace/deployment` > `imagestream:namespace/nombre`.
+
+### Esqueleto ya generado
+
+`scripts/repo_mapping.json` ya trae **425 claves** (con valor `""` vacío)
+extraídas de la última corrida completa, una por cada namespace/deployment
+o `imagestream:namespace/nombre` que quedó sin repo detectado — agrupando
+automáticamente los que comparten ImageStream para no repetir entradas.
+Dos de ellas vienen **pre-llenadas** por alta confianza (mismo ImageStream,
+mismo namespace, que un hermano/tag sí resolvió en la misma corrida) —
+**confírmalas igual antes de dar por buena la corrida**:
+- `imagestream:hsm-prod/hsm-commander-api` → `credibanco-repositories/hsm-commander-api-cf`
+- `imagestream:migracion-pasarelas-cde/pgw-purchase` → `credibanco-repositories/pgw-purchase`
+
+Las entradas con valor `""` se ignoran silenciosamente (el script cae de
+vuelta a las heurísticas automáticas, que ya sabemos que fallan para esos
+casos) — no rompen nada dejarlas vacías mientras se van completando poco a
+poco. Prioriza llenarlas por namespace/equipo; no hace falta terminarlas
+todas en una sola sesión.
 
 ## Limitaciones conocidas
 

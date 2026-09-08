@@ -46,6 +46,11 @@ on:
         description: "Nombres exactos de namespaces a excluir, separados por coma"
         required: false
         default: "default,openshift,kube-system,kube-public,kube-node-lease"
+      debug_unmatched:
+        description: "Loguear diagnóstico (BuildConfigs/ImageStreams) de cada contenedor sin repo detectado"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -109,9 +114,15 @@ jobs:
           DB_ORACLE_USER: ${{ secrets.DB_ORACLE_USER }}
           DB_ORACLE_PASSWORD: ${{ secrets.DB_ORACLE_PASSWORD }}
           DB_ORACLE_DSN: ${{ secrets.DB_ORACLE_DSN }}
+          DEBUG_UNMATCHED: ${{ github.event.inputs.debug_unmatched || 'false' }}
         run: |
+          EXTRA_FLAGS=()
+          if [ "$DEBUG_UNMATCHED" = "true" ]; then
+            EXTRA_FLAGS+=(--debug-unmatched)
+          fi
           python scripts/openshift_github_audit.py \
             --output audit-result.json \
             --exclude-prefixes "$NAMESPACE_EXCLUDE_PREFIXES" \
             --exclude-exact "$NAMESPACE_EXCLUDE_EXACT" \
-            --github-api-url "$GITHUB_API_URL"
+            --github-api-url "$GITHUB_API_URL" \
+            "${EXTRA_FLAGS[@]}"

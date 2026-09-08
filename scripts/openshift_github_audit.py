@@ -394,45 +394,70 @@ def _is_base_image_repo(owner: str, repo: str) -> bool:
     return (owner.lower(), repo.lower()) in KNOWN_BASE_IMAGE_REPOS
 
 
-def find_source_via_image_labels(namespace: str, imagestream: str, tag: str) -> Optional[dict]:
-    istag = oc_json("get", "imagestreamtag", f"{imagestream}:{tag}", "-n", namespace)
-    if not istag:
-        return None
-    labels = (
-        istag.get("image", {})
-        .get("dockerImageMetadata", {})
-        .get("Config", {})
-        .get("Labels", {})
-        or {}
-    )
-    # Convenciones estándar de builds S2I de OpenShift
-    for key in ("io.openshift.build.source-location", "org.opencontainers.image.source"):
-        value = labels.get(key)
-        if value:
-            repo = extract_github_repo(value)
-            if repo and not _is_base_image_repo(*repo):
-                return {
-                    "owner": repo[0],
-                    "repo": repo[1],
-                    "raw_uri": value,
-                    "detection_method": f"image-label:{key}",
-                }
+def _first_valid_github_source(candidates: List[Tuple[str, Optional[str]]]) -> Optional[dict]:
+    """candidates: lista de (detection_method, valor). Devuelve el primer
+    valor que contenga un repo de GitHub válido y no sea de la lista de
+    imágenes base conocidas (ver KNOWN_BASE_IMAGE_REPOS)."""
+    for method, value in candidates:
+        if not value:
+            continue
+        repo = extract_github_repo(value)
+        if repo and not _is_base_image_repo(*repo):
+            return {
+                "owner": repo[0],
+                "repo": repo[1],
+                "raw_uri": value,
+                "detection_method": method,
+            }
     return None
 
 
-def _extract_image_info_labels(data: dict) -> Dict[str, str]:
-    """`oc image info -o json` ha tenido distintas formas de anidar el
-    Config.Labels según la versión del CLI; se prueban las rutas conocidas
-    en vez de asumir una sola."""
-    for path in (("config", "config", "Labels"), ("config", "Labels"), ("Config", "Labels")):
+def _env_list_to_dict(env_list: Any) -> Dict[str, str]:
+    """Config.Env de una imagen viene como lista ['CLAVE=valor', ...]."""
+    env: Dict[str, str] = {}
+    if isinstance(env_list, list):
+        for item in env_list:
+            if isinstance(item, str) and "=" in item:
+                key, value = item.split("=", 1)
+                env[key] = value
+    return env
+
+
+def find_source_via_image_labels(namespace: str, imagestream: str, tag: str) -> Optional[dict]:
+    """Revisa tanto las labels (io.openshift.build.source-location,
+    org.opencontainers.image.source) como las variables de entorno
+    horneadas por builds S2I (OPENSHIFT_BUILD_SOURCE) en Config.Env de la
+    imagen — ambas vienen en la misma respuesta de `oc get imagestreamtag`,
+    así que revisarlas no cuesta una llamada extra."""
+    istag = oc_json("get", "imagestreamtag", f"{imagestream}:{tag}", "-n", namespace)
+    if not istag:
+        return None
+    config = istag.get("image", {}).get("dockerImageMetadata", {}).get("Config", {}) or {}
+    labels = config.get("Labels") or {}
+    env = _env_list_to_dict(config.get("Env"))
+    candidates = [
+        (f"image-label:{key}", labels.get(key))
+        for key in ("io.openshift.build.source-location", "org.opencontainers.image.source")
+    ] + [(f"image-env:{key}", env.get(key)) for key in ("OPENSHIFT_BUILD_SOURCE",)]
+    return _first_valid_github_source(candidates)
+
+
+def _extract_image_info_config(data: dict) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """`oc image info -o json` ha tenido distintas formas de anidar
+    Config.Labels/Config.Env según la versión del CLI; se prueban las
+    rutas conocidas en vez de asumir una sola. Devuelve (labels, env)."""
+    for base_path in (("config", "config"), ("config",), ("Config",)):
         node: Any = data
-        for key in path:
+        for key in base_path:
             node = node.get(key) if isinstance(node, dict) else None
             if node is None:
                 break
         if isinstance(node, dict):
-            return node
-    return {}
+            labels = node.get("Labels") if isinstance(node.get("Labels"), dict) else {}
+            env = _env_list_to_dict(node.get("Env"))
+            if labels or env:
+                return labels or {}, env
+    return {}, {}
 
 
 def _is_cluster_internal_host(image: str) -> bool:
@@ -453,46 +478,67 @@ def _is_cluster_internal_host(image: str) -> bool:
 
 
 def find_source_via_image_info(image: str) -> Optional[dict]:
-    """Último fallback: inspecciona la imagen directamente con
-    `oc image info` (sin ImageStream ni BuildConfig de por medio), para
-    leer la label OCI estándar que hornean los pipelines de CI externos a
-    OpenShift (Jenkins, Tekton, GitHub Actions, etc.). Solo tiene sentido
-    para imágenes en un registry externo alcanzable por el runner (ver
-    _is_cluster_internal_host)."""
+    """Último fallback sobre la imagen: inspecciona la imagen directamente
+    con `oc image info` (sin ImageStream ni BuildConfig de por medio), para
+    leer la label OCI estándar o la variable OPENSHIFT_BUILD_SOURCE que
+    hornean los pipelines de CI externos a OpenShift (Jenkins, Tekton,
+    GitHub Actions, etc.). Solo tiene sentido para imágenes en un registry
+    externo alcanzable por el runner (ver _is_cluster_internal_host)."""
     if not image or _is_cluster_internal_host(image):
         return None
     data = oc_image_info(image)
     if not data:
         return None
-    labels = _extract_image_info_labels(data)
-    for key in ("org.opencontainers.image.source", "io.openshift.build.source-location"):
-        value = labels.get(key)
-        if value:
-            repo = extract_github_repo(value)
-            if repo and not _is_base_image_repo(*repo):
-                return {
-                    "owner": repo[0],
-                    "repo": repo[1],
-                    "raw_uri": value,
-                    "detection_method": f"image-info-label:{key}",
-                }
-    return None
+    labels, env = _extract_image_info_config(data)
+    candidates = [
+        (f"image-info-label:{key}", labels.get(key))
+        for key in ("org.opencontainers.image.source", "io.openshift.build.source-location")
+    ] + [(f"image-info-env:{key}", env.get(key)) for key in ("OPENSHIFT_BUILD_SOURCE",)]
+    return _first_valid_github_source(candidates)
+
+
+def find_source_via_deployment_metadata(dep: dict) -> Optional[dict]:
+    """Busca la URL del repo directamente en las anotaciones/labels del
+    propio objeto Deployment y de su pod template — no cuesta ninguna
+    llamada extra a `oc` (el Deployment ya está en memoria). Cubre el caso
+    de pipelines de CI/CD (GitOps, Helm, un script propio) que estampan el
+    repo de origen ahí al desplegar, incluso cuando la imagen misma no
+    lleva ninguna label ni hay BuildConfig/ImageStream en el cluster."""
+    meta = dep.get("metadata", {}) or {}
+    tmpl_meta = (dep.get("spec", {}) or {}).get("template", {}).get("metadata", {}) or {}
+    candidates: List[Tuple[str, Optional[str]]] = []
+    for source_name, source in (
+        ("deployment-annotation", meta.get("annotations") or {}),
+        ("deployment-label", meta.get("labels") or {}),
+        ("pod-template-annotation", tmpl_meta.get("annotations") or {}),
+        ("pod-template-label", tmpl_meta.get("labels") or {}),
+    ):
+        for key, value in source.items():
+            if isinstance(value, str):
+                candidates.append((f"{source_name}:{key}", value))
+    return _first_valid_github_source(candidates)
 
 
 def find_github_source(
-    namespace: str, image: str, imagestream: Optional[str], tag: Optional[str], cache: NamespaceCache
+    namespace: str,
+    image: str,
+    imagestream: Optional[str],
+    tag: Optional[str],
+    dep: dict,
+    cache: NamespaceCache,
 ) -> Optional[dict]:
     """Intenta encontrar el repo de GitHub de origen de un contenedor.
-    Si se resolvió un ImageStream/Tag (imagestream y tag no None), primero
-    intenta los métodos que dependen de eso (BuildConfig -> ImageStreamTag,
-    anotaciones, labels de la imagen). Si no hay ImageStream (apps cuyo
-    BuildConfig empuja directo al registry con output.to.kind=DockerImage),
-    o si esos métodos no encontraron nada, cae a comparar la imagen del
-    contenedor directo contra el output de los BuildConfigs del namespace,
-    y como último recurso a inspeccionar la imagen misma (para apps
-    construidas por CI externo a OpenShift, sin BuildConfig ni ImageStream
-    en el cluster)."""
-    finders = []
+    Primero revisa las anotaciones/labels del Deployment mismo (gratis, ya
+    está en memoria). Si se resolvió un ImageStream/Tag (imagestream y tag
+    no None), sigue con los métodos que dependen de eso (BuildConfig ->
+    ImageStreamTag, anotaciones, labels/env de la imagen). Si no hay
+    ImageStream (apps cuyo BuildConfig empuja directo al registry con
+    output.to.kind=DockerImage), o si esos métodos no encontraron nada,
+    cae a comparar la imagen del contenedor directo contra el output de
+    los BuildConfigs del namespace, y como último recurso a inspeccionar
+    la imagen misma (para apps construidas por CI externo a OpenShift, sin
+    BuildConfig ni ImageStream en el cluster)."""
+    finders = [lambda: find_source_via_deployment_metadata(dep)]
     if imagestream and tag:
         finders.extend(
             [
@@ -791,11 +837,19 @@ def load_repo_mapping(path: Optional[str]) -> Dict[str, str]:
     """Carga el JSON de mapeo manual. Formato:
         {
           "namespace/deployment": "owner/repo",
-          "namespace/deployment/container": "owner/repo"
+          "namespace/deployment/container": "owner/repo",
+          "imagestream:namespace/nombre-del-imagestream": "owner/repo"
         }
     La clave con container es para el caso poco común de un Deployment con
     varios contenedores que van a repos distintos; si no se especifica, se
     usa "namespace/deployment" para todos sus contenedores.
+    La clave "imagestream:..." es la más económica cuando varios
+    Deployments comparten el mismo ImageStream (típico de réplicas/colas
+    nombradas con sufijo numérico, ej. "socket-connection-dcc-1".."-10"
+    todas sobre el ImageStream "socket-connection-dcc"): una sola entrada
+    cubre a todas, en vez de repetir la entrada por cada deployment.
+    Prioridad: namespace/deployment/container > namespace/deployment >
+    imagestream:namespace/nombre.
     Es opcional: si el archivo no existe, se continúa sin mapeo manual
     (no es un error, ya que la mayoría de las corridas no lo necesitan)."""
     if not path:
@@ -816,9 +870,19 @@ def load_repo_mapping(path: Optional[str]) -> Dict[str, str]:
     return data
 
 
-def lookup_repo_mapping(mapping: Dict[str, str], namespace: str, deployment: str, container: str) -> Optional[str]:
+def lookup_repo_mapping(
+    mapping: Dict[str, str],
+    namespace: str,
+    deployment: str,
+    container: str,
+    imagestream_name: Optional[str] = None,
+) -> Optional[str]:
     for key in (f"{namespace}/{deployment}/{container}", f"{namespace}/{deployment}"):
         value = mapping.get(key)
+        if value:
+            return value
+    if imagestream_name:
+        value = mapping.get(f"imagestream:{namespace}/{imagestream_name}")
         if value:
             return value
     return None
@@ -920,7 +984,9 @@ def main() -> int:
                 # Se usa tal cual, sin correr ninguna heurística automática,
                 # porque es la fuente más confiable para los casos sin ninguna
                 # señal detectable en OpenShift.
-                mapped = lookup_repo_mapping(repo_mapping, ns, dep_name, cm["container"])
+                mapped = lookup_repo_mapping(
+                    repo_mapping, ns, dep_name, cm["container"], cm["imagestream"]
+                )
                 source: Optional[dict] = None
                 if mapped:
                     if "/" in mapped:
@@ -936,13 +1002,16 @@ def main() -> int:
                             f"{ns}/{dep_name}/{cm['container']}: entrada de mapeo manual inválida "
                             f"'{mapped}' (debe ser 'owner/repo')"
                         )
-                # Prioridad 2: heurísticas automáticas. Se intenta buscar el
-                # repo aunque no se haya resuelto un ImageStream (ver
-                # find_source_via_buildconfig_direct_image): hay apps cuyo
-                # BuildConfig empuja directo al registry.
-                elif cm["image"] or (cm["imagestream"] and cm["tag"]):
+                # Prioridad 2: heurísticas automáticas. Siempre se intentan
+                # (incluso sin ImageStream resuelto, ver
+                # find_source_via_buildconfig_direct_image, y aunque no
+                # haya imagen: find_source_via_deployment_metadata no la
+                # necesita, revisa el propio Deployment).
+                else:
                     try:
-                        source = find_github_source(ns, cm["image"], cm["imagestream"], cm["tag"], cache)
+                        source = find_github_source(
+                            ns, cm["image"], cm["imagestream"], cm["tag"], dep, cache
+                        )
                     except Exception as exc:
                         errors.append(
                             f"{ns}/{dep_name}/{cm['container']}: error buscando origen GitHub: {exc}"
